@@ -29,6 +29,7 @@ dots.tts achieves the best average performance on **Seed-TTS-Eval**, with WERs o
   - [Python API](#python-api)
   - [Web Demo (Gradio)](#web-demo-gradio)
   - [Fine-tuning](#fine-tuning)
+  - [MeanFlow Distillation](#meanflow-distillation)
 - [Architecture](#-architecture)
 - [Performance](#-performance)
   - [Seed-TTS-Eval](#seed-tts-eval)
@@ -158,7 +159,7 @@ The model, execution mode, precision, optimize flag, and max generation length a
 
 ### Fine-tuning
 
-This repo currently exposes a fine-tuning entry point only. We are open to releasing the full training pipeline (pretraining, self-corrective alignment, and MeanFlow distillation) in the future. Fine-tune from a released checkpoint with:
+This repo exposes fine-tuning and MeanFlow distillation entry points. Fine-tune from a released checkpoint with:
 
 ```bash
 accelerate launch scripts/train_dots_tts.py --config configs/dots_tts.yaml
@@ -177,6 +178,55 @@ Manifest format — one JSON per line, minimum three fields:
 ```json
 {"fid": "sample-0001", "audio": "/abs/path/to/audio.wav", "text": "hello world"}
 ```
+
+### MeanFlow Distillation
+
+MeanFlow distillation trains a MeanFlow DiT student against a frozen flow-matching teacher. The teacher can be the released SOAR checkpoint or any compatible flow-matching dots.tts checkpoint you have fine-tuned yourself.
+
+To use SOAR as the teacher, download it first:
+
+```bash
+huggingface-cli download rednote-hilab/dots.tts-soar \
+  --local-dir pretrained_models/dots.tts-soar
+```
+
+Then launch distillation with the MeanFlow config:
+
+```bash
+accelerate launch \
+  --num_processes 2 \
+  --mixed_precision bf16 \
+  scripts/train_dots_tts_meanflow.py \
+  --config configs/dots_tts_meanflow.yaml \
+  --teacher-model-path pretrained_models/dots.tts-soar
+```
+
+To distill from your own fine-tuned teacher, pass that checkpoint instead:
+
+```bash
+accelerate launch \
+  --num_processes 2 \
+  --mixed_precision bf16 \
+  scripts/train_dots_tts_meanflow.py \
+  --config configs/dots_tts_meanflow.yaml \
+  --teacher-model-path /path/to/your_finetuned_teacher
+```
+
+`configs/dots_tts_meanflow.yaml` is a conservative smoke configuration that uses the same LJSpeech manifests produced by `scripts/prepare_train_jsonl_manifest.py`. Replace `train.pretrained_model_path`, `--teacher-model-path`, `train_data.sources` / `val_data.sources`, `train.output_dir`, and `train.max_train_steps` for your own distillation run.
+
+By default, the script initializes the student from `train.pretrained_model_path`, adds the MeanFlow duration embedding, freezes the non-DiT modules, and trains `student.core.velocity_field_predictor`. MeanFlow does not run a separate CFG branch at inference time; the default `fused` mode distills the guided teacher target into the student. Training checkpoints save the MeanFlow student only; the frozen teacher is not written into the checkpoint model directory. Pass `--train-all-parameters` only if you want to update the full dots.tts model.
+
+Common MeanFlow flags:
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--teacher-model-path` | Frozen flow-matching teacher directory. Defaults to `train.pretrained_model_path` if omitted. | `train.pretrained_model_path` |
+| `--teacher-steps` | Teacher rollout steps used to build the distillation target. Higher is slower and usually stronger. | `8` |
+| `--teacher-solver` | Teacher ODE solver: `euler`, `midpoint`, or `rk4`. | `euler` |
+| `--cfg-distill-mode` | `fused` distills a guided teacher target into the student; `natural` trains on sampled conditional/unconditional masks without fusing CFG. | `fused` |
+| `--distill-cfg-scale` | Extra CFG coefficient used when `--cfg-distill-mode fused` is enabled. It matches inference `guidance_scale` semantics: `teacher_cond + scale * (teacher_cond - teacher_uncond)`. | `1.2` |
+| `--anchor-prob` | Probability of using a zero-duration anchor sample in MeanFlow training. | `0.5` |
+| `--debug` | Print the first few batch summaries and gradient diagnostics. | off |
 
 ---
 

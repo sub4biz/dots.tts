@@ -882,6 +882,176 @@ class IOHelper:
         return tuple(results)
 
     @staticmethod
+    def prepare_meanflow_inputs_for_dit(
+        *,
+        hiddens: torch.Tensor,
+        latents: torch.Tensor,
+        latent_lens: torch.Tensor,
+        hidden_proj,
+        latent_proj,
+        noisy_proj,
+        span_mask: torch.Tensor,
+        hidden_patch_size: int,
+        latent_patch_size: int,
+        cfg_mask: torch.Tensor,
+        noise_latents: torch.Tensor,
+    ) -> dict[str, Any]:
+        if hidden_patch_size != 1:
+            raise ValueError("MeanFlow training only supports hidden_patch_size=1.")
+
+        batch_size = hiddens.size(0)
+        device = hiddens.device
+
+        span_hidden_list = []
+        for batch_idx in range(batch_size):
+            indices = span_mask[batch_idx].nonzero(as_tuple=False).squeeze(-1)
+            span_hidden_list.append(hiddens[batch_idx, indices, :])
+        hiddens = pad_sequence(span_hidden_list, batch_first=True, padding_value=0.0)
+        hidden_lens = torch.tensor(
+            [item.size(0) for item in span_hidden_list],
+            device=device,
+            dtype=torch.long,
+        )
+
+        history_latents = latent_proj(latents)
+        fm_dim = history_latents.shape[-1]
+        latent_history_patch_size = (
+            latent_patch_size * history_latents.size(1) // latents.size(1)
+        )
+
+        hiddens = hidden_proj(mask_data(hiddens, cfg_mask))
+        projected_noise = noisy_proj(noise_latents)
+
+        hist_chunk_size = hidden_patch_size + latent_history_patch_size
+        valid_patch_counts = latent_lens // latent_patch_size
+        fm_prefix_lengths = hidden_lens + valid_patch_counts * (
+            hist_chunk_size - hidden_patch_size
+        )
+        fm_gen_lengths = latent_lens + valid_patch_counts * hidden_patch_size
+        fm_gen_patch_size = hidden_patch_size + latent_patch_size
+        fm_seq_lengths = fm_prefix_lengths + fm_gen_lengths
+        fm_seq = torch.zeros(
+            (batch_size, int(fm_seq_lengths.max().item()), fm_dim),
+            dtype=history_latents.dtype,
+            device=device,
+        )
+        history_latent_span_mask = torch.zeros(
+            (batch_size, int(fm_seq_lengths.max().item())),
+            dtype=torch.bool,
+            device=device,
+        )
+        noise_region_starts = []
+
+        for batch_idx in range(batch_size):
+            patch_count = int(valid_patch_counts[batch_idx].item())
+            hidden_len = int(hidden_lens[batch_idx].item())
+            if patch_count <= 0 or hidden_len <= 0:
+                noise_region_starts.append(0)
+                continue
+
+            hidden_block = hiddens[batch_idx, :hidden_len].reshape(
+                patch_count,
+                hidden_patch_size,
+                fm_dim,
+            )
+            history_block = history_latents[
+                batch_idx,
+                : patch_count * latent_history_patch_size,
+                :,
+            ].reshape(patch_count, latent_history_patch_size, fm_dim)
+            interleaved = rearrange(
+                torch.cat([hidden_block, history_block], dim=1),
+                "n h d -> (n h) d",
+            )
+
+            span_indices = torch.arange(patch_count, device=device) * hist_chunk_size
+            span_indices_expanded = torch.stack(
+                [span_indices + idx for idx in range(hist_chunk_size)],
+                dim=1,
+            )
+            fm_seq[batch_idx, span_indices_expanded.reshape(-1), :] = interleaved
+            history_latent_span_mask[batch_idx, span_indices] = True
+
+            noise_start = patch_count * hist_chunk_size
+            noise_region_starts.append(noise_start)
+            noise_part = torch.cat(
+                [
+                    hidden_block,
+                    projected_noise[
+                        batch_idx,
+                        : patch_count * latent_patch_size,
+                        :,
+                    ].reshape(patch_count, latent_patch_size, fm_dim),
+                ],
+                dim=1,
+            )
+            noise_part = rearrange(noise_part, "n h d -> (n h) d")
+            noise_end = noise_start + int(fm_gen_lengths[batch_idx].item())
+            fm_seq[batch_idx, noise_start:noise_end, :] = noise_part
+
+        fm_attn_mask, fm_seq_mask, fm_pos_ids = (
+            CausalHelper().create_causal_chunk_mask_and_pos(
+                batch_size=batch_size,
+                C_lens=fm_prefix_lengths,
+                Z_lens=fm_gen_lengths,
+                span_mask=history_latent_span_mask,
+                patch_size=fm_gen_patch_size,
+            )
+        )
+        return {
+            "fm_seq": fm_seq,
+            "fm_attn_mask": fm_attn_mask,
+            "fm_seq_mask": fm_seq_mask,
+            "fm_pos_ids": fm_pos_ids,
+            "fm_prefix_lengths": fm_prefix_lengths.unsqueeze(1),
+            "fm_gen_lengths": fm_gen_lengths.unsqueeze(1),
+            "fm_gen_patch_size": fm_gen_patch_size,
+            "noise_region_starts": torch.tensor(
+                noise_region_starts,
+                device=device,
+                dtype=torch.long,
+            ),
+            "noise_chunk_size": fm_gen_patch_size,
+            "noise_inner_offset": hidden_patch_size,
+            "valid_patch_counts": valid_patch_counts,
+            "latent_lens": latent_lens,
+            "latent_patch_size": latent_patch_size,
+        }
+
+    @staticmethod
+    def replace_noise_latents_in_fm_seq(
+        prefix_data: dict[str, Any],
+        new_noise_latents: torch.Tensor,
+        noisy_proj,
+    ) -> torch.Tensor:
+        projected = noisy_proj(new_noise_latents)
+        fm_seq = prefix_data["fm_seq"].clone()
+        starts = prefix_data["noise_region_starts"]
+        chunk_size = int(prefix_data["noise_chunk_size"])
+        inner_offset = int(prefix_data["noise_inner_offset"])
+        latent_patch_size = int(prefix_data["latent_patch_size"])
+        valid_patch_counts = prefix_data["valid_patch_counts"]
+
+        for batch_idx in range(fm_seq.size(0)):
+            patch_count = int(valid_patch_counts[batch_idx].item())
+            if patch_count <= 0:
+                continue
+            base = int(starts[batch_idx].item())
+            for patch_idx in range(patch_count):
+                src_start = patch_idx * latent_patch_size
+                dst_start = base + patch_idx * chunk_size + inner_offset
+                fm_seq[
+                    batch_idx,
+                    dst_start : dst_start + latent_patch_size,
+                    :,
+                ] = projected[
+                    batch_idx,
+                    src_start : src_start + latent_patch_size,
+                    :,
+                ]
+        return fm_seq
+
+    @staticmethod
     def get_dit_outputs(
         pred_v,
         fm_prefix_lengths,
